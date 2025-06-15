@@ -1,0 +1,477 @@
+---
+title: "Methods Part I"
+author: "You"
+date: "2025-01-07"
+output: pdf_document
+---
+
+# Data Cleaning                   
+
+MetaboAnalystR takes in dataframe formatted in which column 1 is sample id, column 2 is the sample group (best response) and column 3 to n is each metabolite.     
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+library(dplyr)
+library(magrittr)
+library(openxlsx)
+library(tidyr)
+library(readxl)
+library(ggplot2)
+library(patchwork)
+library(car)
+```
+
+## Clean up the metadata data frame          
+This section cleans up the metadata dataframe and process it into two types of metadata dataframe. One is for the MetaboAnalystR pipeline which requires the `sample_id` and the `best_response` columns. The other one is for survival analysis, which requires survival info as well as co-variate information. In this analysis, overall survival (OS) at 12 months or progression free survival (PFS) at 6 months are considered as study endpoints.      
+     
+```{r warning=FALSE}
+# set working directory
+setwd("~/Desktop/metabolomics/")
+
+# metadata 
+meta <- read_xlsx("data/metadata/2025_Jan_02_immunotherapy_lipidomics.xlsx") 
+meta <- as.data.frame(meta)
+
+## metadata for metaboAnalyst Analysis 
+meta_for_metaboAnalyst <- meta %>% 
+  dplyr::select(Sample.ID, Response_Rank_1) %>% 
+  dplyr::rename(sample_id = Sample.ID, best_response = Response_Rank_1)
+
+## metadata for survival analysis 
+meta_for_survival_analysis <- meta %>% 
+  dplyr::select(Sample.ID, Further.Sample.info., Response_Rank_1, Age, Sex, 
+                Etiology, Etiology_Rank, Etiology_viral_Nonviral, 
+                AFP, `Child-Pugh Score`, `MTD(cm)`, `Number of nodules`, 
+                `BCLC STAGE`, OS_event, OS_12, PFS, PFS_6Months) %>% 
+  dplyr::mutate(Etiology_Rank = case_when(Etiology_Rank == "nash" ~ "NASH", 
+                                          TRUE ~ Etiology_Rank))
+colnames(meta_for_survival_analysis) <- c("sample_id", "sample_time", "best_response", 
+                                          "age", "sex", "etiology", "etiology_rank", 
+                                          "etiology_viral", "AFP", "child_pugh_score", 
+                                          "MTD_cm", "No.of.Nodules", "BCLC", "OS_event", 
+                                          "OS_time", "PFS_time", "PFS_event")
+
+#write.csv(meta_for_metaboAnalyst, "data/metadata/meta_for_metaboAnalyst.csv", row.names = F, quote = F)
+#write.csv(meta_for_survival_analysis, "data/metadata/meta_for_survival_analysis.csv", row.names = F, quote = F)
+```
+
+## Processing Metabolomics data         
+In this section we will start processing the metabolomics data-sets. We have obtained 4 data-sets in total, they are:         
+1. Lipidomic reversed phase positive ion mode (LPOS)        
+2. Lipidomic reversed phase negative ion mode (LNEG)        
+3. B.I.Quant-PSTM (quantification of up to 41 metabolites in serum in mmol/L)       
+4. B.I.LISA (lipoprotein analysis for 112 lipoprotein variables in serum)       
+
+Each dataframe comes with about 20-21 columns of metadata and 40-7000 columns of metabolite information respectively. The goal of this step is to clean up the dataframe, give them the correct column name as well as selecting columns we are interested in.     
+
+```{r warning=FALSE}
+setwd("~/Desktop/metabolomics/")
+
+if(!file.exists("data/cleaned_data/metabolomics.rds")){
+  # Get all paths of combineData.csv files recursively
+  file_paths <- list.files(path = "data/raw_data", pattern = "combinedData\\.csv", 
+                           full.names = TRUE, recursive = TRUE)
+  metabolomics <- lapply(file_paths, read.csv)
+  names(metabolomics) <- c("LISA", "QUANT", "LNEG", "LPOS")
+  
+  # rename the columns 
+  metabolomics <- lapply(metabolomics, function(x){
+    idx_end <- which(colnames(x) == "Max_Grade_SE")
+    idx_start <- idx_end+1
+    max_col <- ncol(x)
+    colnames(x) <- c("feature_name", colnames(x)[2:idx_end], x[1, idx_start:max_col]) %>% 
+      unlist() %>% unname()
+    return(x)
+  })
+  
+  # filter metabolomic data 
+  sample_id <- meta_for_metaboAnalyst$sample_id
+  metabolomics <- lapply(metabolomics, function(x){
+    dplyr::filter(x, Sample.ID %in% sample_id) 
+  })
+  
+  # for each df, keep only the sample_id column and metabolomics_id column 
+  metabolomics_id <- read.delim("data/metadata/metabolomics_id.txt", 
+                                header = F) %>% unlist() %>% unname()
+  metabolomics <- lapply(metabolomics, function(x){
+    x %>% dplyr::select("Sample.ID", any_of(metabolomics_id))
+  })
+  
+  # save file   
+  saveRDS(metabolomics, "data/cleaned_data/metabolomics.rds")
+} else {
+  metabolomics <- readRDS("data/cleaned_data/metabolomics.rds")
+}
+```
+
+# Data Exploration                   
+
+## Metadata exploration        
+After data cleaning, we recognized that there are **in total 66 samples**, of those, 7 samples are with progressive disease, 14 samples with partial response, and another 42 samples with stable disease, there are 3 more samples with uncertain treatment response. 
+Of those 66 samples, 31 of them were taken at treatment baseline, 16 samples were taken when samples experienced disease progression, and another 19 samples were taken when there are observable treatment response in samples. There is only one sample who were diagnosed as BCLC stage A, 22 samples were diagnosed as BCLC stage B and majority (n = 37) samples were diagnosed as BCLC stage C. 
+The most common primary etiology of this cohort of hepatocellular carcinoma patient is Alcohol and HCV infection (both n = 18), followed by HBV infection (n = 15), and NASH (n = 6). Thus, there are 24 samples with primary etiology being non-viral and 33 samples with primary etiology being viral. Majority of samples have `child_pugh_score` of 5 (n = 46), 11 samples with score of 6, 2 samples with score of 8, and only 1 sample with score of 9. Lastly, for number of nodules, majority samples were diagnosed with only 1 nodule (n = 22), followed by 20 samples diagnosed as multi-nodule, and another 9 samples with 3 nodules and 8 samples with 2 nodules, and only 1 sample with 0 nodule.          
+```{r fig.height=3, warning=FALSE, echo=FALSE}
+# Function to create a pie chart with a legend
+create_pie_chart <- function(data, column) {
+  counts <- table(data[[column]], useNA = "ifany")
+  df <- as.data.frame(counts)
+  colnames(df) <- c("Response", "Count")
+  df <- df %>% mutate(Percentage = Count / sum(Count) * 100)
+  
+  ggplot(df, aes(x = "", y = Count, fill = Response)) +
+    geom_bar(stat = "identity", width = 1) +
+    coord_polar(theta = "y") +
+    theme_void() +
+    labs(title = column) +
+    scale_fill_brewer(palette = "Set3") +  
+    theme(legend.title = element_blank(), 
+          legend.key.height = unit(0.5, "lines"), 
+          legend.key.width = unit(0.6, "lines"), 
+          title = element_text(size = 7)) 
+}
+
+# Create individual pie charts
+p1 <- create_pie_chart(meta_for_survival_analysis, "best_response")
+p2 <- create_pie_chart(meta_for_survival_analysis, "sample_time")
+p3 <- create_pie_chart(meta_for_survival_analysis, "BCLC")
+p4 <- create_pie_chart(meta_for_survival_analysis, "etiology_rank")
+p5 <- create_pie_chart(meta_for_survival_analysis, "child_pugh_score")
+p6 <- create_pie_chart(meta_for_survival_analysis, "No.of.Nodules")
+
+# Combine plots into a panel
+(p1 + p2 + p3) / (p4 + p5 + p6)
+```
+
+The minimum age for this cohort is 36.93, and maximum age is 81.00, median age is 68.21 and mean age is 67.07. There are 58 male samples and 2 female samples, other 6 samples with unknown sex. The minimum AFP of this cohort is 2, maximum is 52415.00, with median AFP being 26.50 while mean AFP being 2209.78. The minimum MTD is 1.4 cm, maximum is 18 cm, with median being 5.5 cm and mean being 7.188 cm.       
+
+```{r fig.height=2, warning=FALSE, echo=FALSE}
+p1 <- ggplot(meta_for_survival_analysis, aes(x = age)) + 
+  geom_density() + 
+  geom_vline(xintercept = c(68.21, 67.07), linetype = "dashed") + 
+  labs(title = "Density Plot of age", x = "age", y = "Density") +  
+  theme(title = element_text(size = 7), 
+        axis.text.x = element_text(angle = 45, vjust = 1)) 
+
+p2 <- ggplot(meta_for_survival_analysis, aes(x = AFP)) + 
+  geom_density() + 
+  geom_vline(xintercept = c(26.50, 2209.78), linetype = "dashed") + 
+  labs(title = "Density Plot of AFP", x = "AFP", y = "Density") +  
+  theme(title = element_text(size = 7), 
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) 
+
+p3 <- ggplot(meta_for_survival_analysis, aes(x = MTD_cm)) + 
+  geom_density() + 
+  geom_vline(xintercept = c(5.5, 7.188), linetype = "dashed") + 
+  labs(title = "Density Plot of MTD (cm)", x = "MTD (cm)", y = "Density") +  
+  theme(title = element_text(size = 7),
+        axis.text.x = element_text(angle = 45, vjust = 1))
+
+p1 + p2 + p3
+```
+
+The endpoints of this study were defined as 6-month progression-free survival (PFS) and 12-month overall survival (OS). At 6 months, there were 12 samples without progression and 48 samples with progression. At 12 months, 20 samples remained alive, while 40 samples had unfortunately deceased.        
+
+
+## Metabolomics exploration        
+
+For each of the metabolomics dataset we want to understand:           
+1. Range of the values            
+2. Are there metabolites with all 0 values          
+3. heteroskedasticity       
+
+```{r warning=FALSE}
+# first, make a combined dataframe 
+combined_data <- purrr::reduce(.x = metabolomics, .f = merge, by = "Sample.ID", all = T)
+combined_data <- apply(combined_data, 2, as.numeric) %>% 
+  as.data.frame() %>% 
+  tibble::column_to_rownames(var = "Sample.ID")
+
+# next, make columns for df 
+name = colnames(combined_data)
+category = c(rep("LISA", 112), rep("QUANT", 41), rep("LNEG", 1640), rep("LPOS", 7067))
+median = miscTools::colMedians(combined_data, na.rm = TRUE)
+mean = colMeans(combined_data, na.rm = TRUE)
+max = unname(apply(combined_data, 2, function(x){max(x, na.rm = TRUE)}))
+zero_count = unname(apply(combined_data, 2, function(x){sum(x == 0, na.rm = TRUE)}))
+zero_count = ifelse(zero_count == 0, "no zeros", 
+                    ifelse(zero_count < 12, "below 20%=0", "over 20%=0"))
+
+# make df 
+summary <- data.frame(metabolite = name, category = category, median = median, 
+                 median_log = log2(median + 1), mean = mean, 
+                 mean_log = log2(mean + 1), max = max, 
+                 max_log = log2(max + 1), zero_count = zero_count)
+#write.csv(summary, "~/Desktop/metabolomics/data/data_exploration/summary_raw.csv", row.names = F)
+```
+
+Because there are over 8000 metabolites across 4 datasets, we used density plot to look at the distribution of median, mean, and maximum of the metabolite intensities for these 8000 metabolites. We also looked at the number of zero-counts for each metabolites across 66 samples. For better visualization, `log2(x + 1)` was applied to the distribution of median, mean, and maximum value of these 8000 metabolites.            
+Looking at those original values:         
+1. LPOS (Min = 0, Median = 80,803, Mean = 1,164,529, Max = 855,443,913);         
+2. LNEG (Min = 0, Median = 62,253, Mean = 280,635, Max = 46,777,580);       
+3. LISA (Min = 0, Median = 9, Mean = 56, Max = 3,882);         
+4. QUANT (Min = 0, Median = 0.03, Mean = 0.32, Max = 27.75)        
+
+From the density plot, we can see that the distribution of 4 datasets differs quite vastly. LNEG and LPOS have similar distributions in terms of median, mean, and maximum metabolite intensities. LISA dataset holistically have smaller metabolite intensities compared to LNEG and LPOS dataset, with completely non-overlapping distributions. While QUANT dataset have prominent number of zero-counts and low-metabolite intensities, as characterized by the high purple peak at the lower end of x-axis.         
+
+In terms of number of zeros, very few LNEG and LPOS metabolites exhibits zero-counts. While about 30% of metabolites in LISA dataset have zero-counts, but were mostly below 20% of samples. However, only ~27% of metabolites in QUANT dataset have no zero-counts across samples and over 50% of metabolites in QUANT dataset have zero-counts over 20% of samples.        
+
+```{r echo=FALSE, fig.height=6, warning=FALSE}
+# Define the plotting function
+create_density_plot <- function(data, variable, title) {
+  ggplot(data, aes_string(x = "category", y = variable, fill = "category")) + 
+    geom_boxplot(alpha = 0.5) +
+    labs(title = title) + 
+    theme(legend.key.height = unit(0.5, "lines"), 
+          legend.key.width = unit(0.6, "lines"), 
+          title = element_text(size = 8), 
+          legend.position = "bottom", 
+          legend.direction = "horizontal", 
+          legend.title = element_blank(), 
+          axis.title.x = element_blank(), 
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) 
+}
+
+# Use the function to create plots
+p1 <- create_density_plot(summary, "median_log", "Density of Median Log")
+p2 <- create_density_plot(summary, "mean_log", "Density of Mean Log")
+p3 <- create_density_plot(summary, "max_log", "Density of Max Log")
+
+# Calculate percentages
+data_long <- as.data.frame(table(summary$category, summary$zero_count))
+colnames(data_long) <- c("category", "zero_count", "frequency")
+data_long <- data_long %>%
+  group_by(category) %>% mutate(total = sum(frequency)) %>% ungroup() %>% 
+  mutate(percentage = (frequency / total) * 100) 
+data_long$zero_count <- factor(data_long$zero_count, 
+                               levels = c("over 20%=0", "below 20%=0", "no zeros"))
+
+p4 <- ggplot(data_long, aes(x = category, y = percentage, fill = zero_count)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Percentage of Zero Counts") +
+  scale_fill_manual(values = c("#66c2a5", "#fc8d62", "#8da0cb")) + 
+  theme(legend.key.height = unit(0.5, "lines"), 
+        legend.key.width = unit(0.6, "lines"), 
+        title = element_text(size = 8), 
+        legend.position = "bottom", 
+        legend.title = element_blank(), 
+        legend.direction = "vertical")
+
+# plot 
+(p1 + p2) / (p3 + p4)
+```
+
+# Data Pre-processing             
+
+## Quality Control           
+Following the 80% rule, a metabolite is kept for downstream analysis if it has a non-zero value for at least 80% samples.            
+```{r}
+metabolomics_qc <- lapply(metabolomics, function(x){
+  zero_counts <- apply(x, 2, function(y){sum(y == 0, na.rm = TRUE)})
+  remove <- which(zero_counts > 12) %>% names()
+  x <- x %>% dplyr::select(-all_of(remove))
+})
+```
+
+For each metabolomic dataset, we will use principal component analysis to identify potential outlier samples. We define outlier as being 3 standard deviation away from the mean distance to the center.                 
+```{r, warning=FALSE}
+pca_result <- lapply(metabolomics, function(x){
+  # organise data 
+  x <- x %>% apply(2, as.numeric) %>% as.data.frame()
+  x <- x %>% tibble::column_to_rownames(var = "Sample.ID")
+  x <- x[, colSums(x) != 0] # remove columns where all values are 0
+  
+  # perform PCA 
+  pca_result <- prcomp(x, center = TRUE, scale. = TRUE) # perform PCA 
+  pca_data <- data.frame(pca_result$x)
+  
+  # find outlier 
+  pca_data$distance <- sqrt(pca_data$PC1^2 + pca_data$PC2^2)
+  threshold <- mean(pca_data$distance) + 3*sd(pca_data$distance) 
+  outliers <- pca_data[pca_data$distance > threshold, ] %>% rownames()
+  pca_data$outlier <- ifelse(rownames(pca_data) %in% outliers, "outlier", "normal")
+  
+  # return df
+  return(pca_data)
+})
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.height=6}
+# visualise first two components? 
+p1 <- ggplot(pca_result$LISA, aes(x = PC1, y = PC2)) + geom_point() + 
+  geom_label(aes(label = rownames(pca_result$LISA), color = outlier), size = 2) +
+  labs(title = "PCA Plot for LISA") + 
+  theme(title = element_text(size = 8), 
+        legend.position = "bottom", 
+        legend.title = element_blank()) + 
+  ylim(-15, 15) + xlim(-10, 40)
+
+p2 <- ggplot(pca_result$QUANT, aes(x = PC1, y = PC2)) + geom_point() + 
+  geom_label(aes(label = rownames(pca_result$QUANT), color = outlier), size = 2) +
+  labs(title = "PCA Plot for QUANT") + 
+  theme(title = element_text(size = 8), 
+        legend.position = "bottom", 
+        legend.title = element_blank()) + 
+  ylim(-7, 7) + xlim(-5, 7)
+
+p3 <- ggplot(pca_result$LNEG, aes(x = PC1, y = PC2)) + geom_point() + 
+  geom_label(aes(label = rownames(pca_result$LNEG), color = outlier), size = 2) +
+  labs(title = "PCA Plot for LNEG") + 
+  theme(title = element_text(size = 8), 
+        legend.position = "bottom", 
+        legend.title = element_blank()) +
+  ylim(-25, 45) + xlim(-110, 55)
+
+p4 <- ggplot(pca_result$LPOS, aes(x = PC1, y = PC2)) + geom_point() + 
+ geom_label(aes(label = rownames(pca_result$LPOS), color = outlier), size = 2) +
+  labs(title = "PCA Plot for LPOS") + 
+  theme(title = element_text(size = 8), 
+        legend.position = "bottom", 
+        legend.title = element_blank()) + 
+  ylim(-85, 60) + xlim(-110, 200)
+
+(p1 + p2)/(p3 + p4)
+```
+
+Because sample 1210 appears to be outlier in 3/4 datasets (except for BI-QUANT), therefore we will remove sample 1210 in our subsequent analysis.       
+
+```{r, warning=FALSE, eval=FALSE}
+metabolomics_qc <- lapply(metabolomics, function(x){
+  x <- x %>% dplyr::filter(Sample.ID != "1210")
+})
+```
+So, after quality control and normalization, we now have 59 samples across all metabolites, and there are 112 LISA metabolites, 19 QUANT metabolites, 1636 LNEG metabolites, and 7054 LPOS metabolites.        
+
+
+## Normalisation           
+Normalization is very necessary to standardize each metabolite to the same range for subsequent comparison. Row-wise normalization is carried out by `MedianNorm` method to remove unwanted sample-to-sample variation. Column-wise normalization is carried out by `LogNorm` for transformation and `MeanCenter` for scaling and centering. These two methods applied column-wise across each metabolite should hopefully reduce sample heteroscedasticity to minimum.     
+```{r}
+# combine file 
+combined <- purrr::reduce(.x = metabolomics_qc, .f = merge, by = "Sample.ID", all = T)
+combined <- merge(meta_for_metaboAnalyst, combined, by.x = "sample_id", by.y = "Sample.ID")
+combined[, 3:ncol(combined)] <- apply(combined[, 3:ncol(combined)], 2, as.numeric) 
+
+# write file 
+combined_file <- "~/Desktop/metabolomics/data/cleaned_data/combined_raw.csv"
+if(!file.exists(combined_file)){
+  write.csv(combined, combined_file, row.names = F, quote = FALSE)
+} 
+```
+
+```{r, warning=FALSE}
+file = "~/Desktop/metabolomics/data/cleaned_data/combined_norm.csv"
+
+if(!file.exists(file)){
+  # Use MetaboAnalystR to normalise 
+  library(MetaboAnalystR)
+  setwd("~/Desktop/metabolomics/data/cleaned_data/")
+  
+  # normalisation 
+  pre_mSet <- InitDataObjects("conc", "stat", FALSE)
+  pre_mSet <- Read.TextData(pre_mSet, "combined_raw.csv", "rowu", "disc")
+  pre_mSet <- SanityCheckData(pre_mSet) 
+  pre_mSet <- ReplaceMin(pre_mSet) 
+  pre_mSet <- PreparePrenormData(pre_mSet) 
+  pre_mSet <- Normalization(pre_mSet, 
+                            rowNorm = "MedianNorm", 
+                            transNorm = "LogNorm", 
+                            scaleNorm = "MeanCenter", 
+                            ratio = FALSE, 
+                            ratioNum = 20)
+  
+  # normalized data 
+  combined_norm <- pre_mSet$dataSet$norm
+  combined_norm$sample_id <- rownames(combined_norm)
+  combined_norm <- merge(meta_for_metaboAnalyst, combined_norm, by = "sample_id")
+  write.csv(combined_norm, file, quote = F, row.names = F)
+} else {
+  combined_norm <- read.csv(file, check.names = FALSE)
+}
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.height=7}
+plot_df <- as.data.frame(apply(combined_norm[, 3:8823], 2, as.numeric))
+
+# next, make columns for df 
+name = colnames(plot_df)
+category = c(rep("LISA", 112), rep("QUANT", 19), rep("LNEG", 1636), rep("LPOS", 7054))
+median = miscTools::colMedians(plot_df, na.rm = TRUE)
+sum = colSums(plot_df, na.rm = TRUE)
+quantile_1 = unname(apply(plot_df, 2, function(x){unname(quantile(x)[2])}))
+quantile_3 = unname(apply(plot_df, 2, function(x){unname(quantile(x)[4])}))
+max = unname(apply(plot_df, 2, function(x){max(x, na.rm = TRUE)}))
+min = unname(apply(plot_df, 2, function(x){min(x, na.rm = TRUE)}))
+
+# make df 
+summary <- data.frame(metabolite = name, category = category, median = median, 
+                      quantile_1 = quantile_1, quantile_3 = quantile_3, 
+                      max = max, min = min, sum = sum)
+
+# Use the function to create plots
+p1 <- create_density_plot(summary, "median", "Density of Median")
+p2 <- create_density_plot(summary, "quantile_1", "Density of First Quantile")
+p3 <- create_density_plot(summary, "quantile_3", "Density of Third Quantile")
+p4 <- create_density_plot(summary, "max", "Density of Max")
+p5 <- create_density_plot(summary, "min", "Density of Min")
+p6 <- create_density_plot(summary, "sum", "Density of ColSums")
+
+# plot 
+(p1 + p2 + p3) / (p4 + p5 + p6)
+```
+
+After normalization, we also want to check data heteroskedasticity. We will do so by using the Levene's test to assess the equality of variances across treatment response groups.        
+https://datatab.net/tutorial/levene-test        
+```{r warning=FALSE}
+file = "~/Desktop/metabolomics/data/data_exploration/heteroskedasticity.csv"
+
+if(!file.exists(file)){
+  # preparation 
+  combined_norm$best_response <- as.factor(combined_norm$best_response)
+  combined_norm[3:ncol(combined_norm)] <- apply(combined_norm[3:ncol(combined_norm)], 2, 
+                                                as.numeric)
+  
+  # calculate 
+  names <- colnames(combined_norm)[3:ncol(combined_norm)]
+  levene_p_val <- apply(combined_norm[3:ncol(combined_norm)], 2, function(y){
+    result <- leveneTest(y ~ combined_norm$best_response)
+    return(result$`Pr(>F)`[[1]])})
+  levene_F_score <- apply(combined_norm[3:ncol(combined_norm)], 2, function(y){
+    result <- leveneTest(y ~ combined_norm$best_response)
+    return(result$`F value`[[1]])})
+  
+  # dataframe 
+  heteroskedasticity <- data.frame(metabolites = names, 
+                                   levene_F_score = levene_F_score, 
+                                   levene_p_val = levene_p_val)
+  heteroskedasticity$levene_p_adj <- p.adjust(heteroskedasticity$levene_p_val, method = "fdr")
+  write.csv(heteroskedasticity, file, row.names = F, quote = F)
+} else {
+  heteroskedasticity <- read.csv(file)
+}
+```
+
+see discussion here: https://stats.stackexchange.com/questions/24022/why-levene-test-of-equality-of-variances-rather-than-f-ratio            
+```{r warning=FALSE, echo=FALSE, fig.height=3, fig.width=5}
+heteroskedasticity$colour <- ifelse(heteroskedasticity$levene_p_adj < 0.05, "skyblue", 
+                                    ifelse(heteroskedasticity$levene_p_adj < 0.10, "blue", "black"))
+
+ggplot(heteroskedasticity, aes(x = levene_p_adj, y = levene_F_score, colour = colour)) + 
+  geom_point(size = 0.5) + 
+  geom_vline(xintercept = 0.05, linetype = "dashed") + 
+  labs(title = "Levene Test F-score by FDR", x = "FDR", y = "F-score") +
+  scale_colour_identity() 
+```
+
+Only one metabolite was found heteroskedastic by FDR < 0.05, it is `615.15_889.7286m/z` (skyblue), there are also 5 other metabolites with FDR < 0.10, being `389.75_771.6107m/z`, `64.08_510.3379m/z`, `588.8_859.6595m/z`, `64.08_509.3356m/z`, and `615.15_890.7333m/z`.                
+Overall the normalized data-set is found to be not heteroskedastic.        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
